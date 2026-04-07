@@ -59,3 +59,24 @@ pub fn ollama_api_ps() -> Result<Value, String> {
         Err(_) => Ok(serde_json::json!({ "models": [] })),
     }
 }
+
+/// Public library catalog (`GET https://ollama.com/api/tags`) — same JSON shape as local `/api/tags`.
+#[tauri::command]
+pub fn ollama_com_api_tags() -> Result<Value, String> {
+    let url = "https://ollama.com/api/tags";
+    match ureq::get(url).timeout(Duration::from_secs(45)).call() {
+        Ok(resp) => {
+            let status = resp.status();
+            if !(200..300).contains(&status) {
+                return Err(format!("{url} → HTTP {status}"));
+            }
+            let mut body = String::new();
+            resp.into_reader()
+                .take(32 * 1024 * 1024)
+                .read_to_string(&mut body)
+                .map_err(|e| format!("read {url}: {e}"))?;
+            serde_json::from_str(&body).map_err(|e| format!("ollama.com /api/tags: invalid JSON ({e})"))
+        }
+        Err(e) => Err(format!("{url}: {e}")),
+    }
+}

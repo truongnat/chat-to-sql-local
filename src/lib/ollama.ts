@@ -3,6 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 /** Prefer `localhost` so IPv4/IPv6 resolution matches the OS (same as `curl localhost:11434`). */
 const BASE = "http://localhost:11434";
 
+/** Ollama registry: same `/api/tags` response shape as the local daemon; models here are pullable via `ollama pull`. */
+export const OLLAMA_LIBRARY_TAGS_URL = "https://ollama.com/api/tags";
+
 /**
  * Tauri 2 does not always set `window.isTauri`, so `isTauri()` from `@tauri-apps/api/core` can be false
  * inside a real app — then we'd wrongly use `fetch` (blocked / flaky in the WebView) instead of IPC + Rust proxy.
@@ -120,6 +123,40 @@ export async function listModels(): Promise<OllamaModel[]> {
   }
   const raw = extractModelsArrayFromTagsPayload(payload);
   return normalizeTagEntries(raw);
+}
+
+function dedupeModelsByName(models: OllamaModel[]): OllamaModel[] {
+  const seen = new Set<string>();
+  const out: OllamaModel[] = [];
+  for (const m of models) {
+    const n = m.name?.trim();
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
+    out.push(m);
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+/**
+ * Library catalog from ollama.com (pullable names + advertised sizes). Independent of the local daemon.
+ * In Tauri, uses IPC + Rust to avoid WebView CORS limits.
+ */
+export async function listOllamaLibraryCatalog(): Promise<OllamaModel[]> {
+  let payload: unknown;
+  if (useOllamaIpc()) {
+    payload = await invoke<unknown>("ollama_com_api_tags");
+  } else {
+    const r = await fetch(OLLAMA_LIBRARY_TAGS_URL, { method: "GET" });
+    if (!r.ok) throw new Error(`ollama.com tags failed: HTTP ${r.status}`);
+    try {
+      payload = await r.json();
+    } catch {
+      throw new Error("ollama.com /api/tags: invalid JSON");
+    }
+  }
+  const raw = extractModelsArrayFromTagsPayload(payload);
+  return dedupeModelsByName(normalizeTagEntries(raw));
 }
 
 /** Running / loaded models (VRAM). Fails soft if server is old or errors. */

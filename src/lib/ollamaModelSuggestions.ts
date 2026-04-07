@@ -1,6 +1,6 @@
 /**
- * Gợi ý model cố định cho menu (pull / chọn). Luôn được gộp với kết quả GET /api/tags.
- * Sửa một chỗ khi muốn thêm/bớt model mặc định.
+ * Model mặc định / fallback khi catalog ollama.com chưa tải hoặc không có tên đó.
+ * Menu chính lấy từ ollama.com/api/tags + model local (localhost /api/tags).
  */
 export const OLLAMA_MODEL_SUGGESTIONS: readonly string[] = [
   "gemma3:4b",

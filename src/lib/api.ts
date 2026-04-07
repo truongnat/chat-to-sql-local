@@ -10,6 +10,7 @@ export type Dialect =
 export interface Workspace {
   id: number;
   name: string;
+  /** Absolute path: one `.sql` / `.ddl` file, or a directory scanned recursively for those files. */
   rootPath: string;
   dialect: string;
   ollamaModel: string | null;
@@ -154,6 +155,18 @@ export function updateWorkspaceModel(
   return invoke("update_workspace_model", { id, model });
 }
 
+/** Update display name and/or SQL file path (restarts file watcher when path changes). */
+export function updateWorkspace(
+  id: number,
+  opts: { name?: string; rootPath?: string },
+): Promise<void> {
+  return invoke("update_workspace", {
+    id,
+    name: opts.name,
+    rootPath: opts.rootPath,
+  });
+}
+
 export function deleteWorkspace(id: number): Promise<void> {
   return invoke("delete_workspace", { id });
 }
@@ -208,6 +221,20 @@ export function listChatSessions(workspaceId: number): Promise<ChatSession[]> {
   return invoke("list_chat_sessions", { workspaceId });
 }
 
+export function updateChatSessionTitle(
+  sessionId: number,
+  title: string,
+): Promise<void> {
+  return invoke("update_chat_session_title", { sessionId, title });
+}
+
+export function deleteChatSession(
+  workspaceId: number,
+  sessionId: number,
+): Promise<void> {
+  return invoke("delete_chat_session", { workspaceId, sessionId });
+}
+
 export function appendChatMessage(
   sessionId: number,
   role: string,
@@ -222,4 +249,27 @@ export function appendChatMessage(
 
 export function listChatMessages(sessionId: number): Promise<ChatMessage[]> {
   return invoke("list_chat_messages", { sessionId });
+}
+
+export interface SchemaSearchHit {
+  chunkText: string;
+  sourceKind: string;
+  sourceRef: string;
+  score: number;
+}
+
+export function rebuildSchemaVectorIndex(workspaceId: number): Promise<void> {
+  return invoke("rebuild_schema_vector_index", { workspaceId });
+}
+
+export function searchSchemaForChat(
+  workspaceId: number,
+  query: string,
+  topK?: number,
+): Promise<SchemaSearchHit[]> {
+  return invoke("search_schema_for_chat", {
+    workspaceId,
+    query,
+    topK: topK ?? 8,
+  });
 }

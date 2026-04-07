@@ -3,6 +3,7 @@ mod models;
 mod ollama_download;
 mod ollama_launch;
 mod ollama_proxy;
+mod vector_index;
 mod watcher;
 
 use models::{
@@ -18,6 +19,7 @@ use watcher::WatchRegistry;
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub watchers: WatchRegistry,
+    pub db_path: PathBuf,
 }
 
 fn db_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -36,12 +38,18 @@ fn restart_watchers(app: &tauri::AppHandle, state: &AppState) -> Result<(), Stri
         db::list_workspaces(&conn).map_err(|e| e.to_string())?
     };
     for w in workspaces {
-        watcher::start_workspace_watch(
+        if let Err(e) = watcher::start_workspace_watch(
             app.clone(),
             &state.watchers,
             w.id,
-            PathBuf::from(w.root_path),
-        )?;
+            PathBuf::from(&w.root_path),
+        ) {
+            eprintln!(
+                "[sql-chat] no file watcher for workspace \"{}\" (id {}): {}. \
+                 Check Edit workspace → the path must be a .sql/.ddl file or a folder of those files.",
+                w.name, w.id, e
+            );
+        }
     }
     Ok(())
 }
@@ -92,6 +100,48 @@ fn update_workspace_model(
 ) -> Result<(), String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     db::update_workspace_model(&conn, id, model.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_workspace(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    id: i64,
+    name: Option<String>,
+    root_path: Option<String>,
+) -> Result<(), String> {
+    let touch_root = root_path.as_ref().map(|p| !p.trim().is_empty()).unwrap_or(false);
+    if touch_root {
+        watcher::stop_workspace_watch(&state.watchers, id)?;
+    }
+    {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        if let Some(ref n) = name {
+            let t = n.trim();
+            if !t.is_empty() {
+                db::update_workspace_name(&conn, id, t).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(ref p) = root_path {
+            let t = p.trim();
+            if t.is_empty() {
+                return Err("root_path is empty".to_string());
+            }
+            db::update_workspace_root_path(&conn, id, t).map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some(p) = root_path {
+        let t = p.trim();
+        if !t.is_empty() {
+            watcher::start_workspace_watch(
+                app.clone(),
+                &state.watchers,
+                id,
+                std::path::PathBuf::from(t),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -167,6 +217,35 @@ fn list_chat_sessions(state: State<AppState>, workspace_id: i64) -> Result<Vec<C
 }
 
 #[tauri::command]
+fn update_chat_session_title(
+    state: State<AppState>,
+    session_id: i64,
+    title: String,
+) -> Result<(), String> {
+    let t = title.trim();
+    if t.is_empty() {
+        return Err("title is empty".to_string());
+    }
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    db::update_chat_session_title(&conn, session_id, t).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_chat_session(
+    state: State<AppState>,
+    workspace_id: i64,
+    session_id: i64,
+) -> Result<(), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let ok =
+        db::delete_chat_session_for_workspace(&conn, workspace_id, session_id).map_err(|e| e.to_string())?;
+    if !ok {
+        return Err("chat session not found".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn append_chat_message(
     state: State<AppState>,
     session_id: i64,
@@ -183,6 +262,31 @@ fn list_chat_messages(state: State<AppState>, session_id: i64) -> Result<Vec<Cha
     db::list_chat_messages(&conn, session_id).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn rebuild_schema_vector_index(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    workspace_id: i64,
+) -> Result<(), String> {
+    let db_path = state.db_path.clone();
+    std::thread::spawn(move || {
+        vector_index::rebuild_workspace_index_blocking(&app, &db_path, workspace_id);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn search_schema_for_chat(
+    state: State<AppState>,
+    workspace_id: i64,
+    query: String,
+    top_k: Option<i64>,
+) -> Result<Vec<vector_index::SchemaSearchHit>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let k = top_k.unwrap_or(8).clamp(1, 32) as usize;
+    vector_index::search_schema_chunks(&conn, workspace_id, &query, k)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -196,6 +300,7 @@ pub fn run() {
                 watchers: WatchRegistry {
                     inner: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 },
+                db_path: path.clone(),
             };
             app.manage(state);
             let handle = app.handle().clone();
@@ -209,6 +314,7 @@ pub fn run() {
             get_workspace,
             update_workspace_dialect,
             update_workspace_model,
+            update_workspace,
             delete_workspace,
             rescan_workspace,
             save_parsed_schema,
@@ -218,14 +324,19 @@ pub fn run() {
             get_workspace_schema_stats,
             create_chat_session,
             list_chat_sessions,
+            update_chat_session_title,
+            delete_chat_session,
             append_chat_message,
             list_chat_messages,
+            rebuild_schema_vector_index,
+            search_schema_for_chat,
             ollama_launch::try_start_ollama,
             ollama_download::start_ollama_installer_download,
             ollama_download::ollama_installer_exists,
             ollama_download::install_ollama_from_download,
             ollama_proxy::ollama_api_tags,
             ollama_proxy::ollama_api_ps,
+            ollama_proxy::ollama_com_api_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -4,7 +4,8 @@ use crate::models::{
 };
 use rusqlite::{params, Connection};
 use rusqlite::OptionalExtension;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
@@ -99,9 +100,105 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_parsed_schema_objects_workspace ON parsed_schema_objects(workspace_id);
+
+        CREATE TABLE IF NOT EXISTS schema_index_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            source_kind TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            chunk_text TEXT NOT NULL,
+            embedding BLOB,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_schema_index_chunks_workspace ON schema_index_chunks(workspace_id);
         "#,
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaIndexChunk {
+    #[allow(dead_code)]
+    pub id: i64,
+    pub source_kind: String,
+    pub source_ref: String,
+    pub chunk_text: String,
+    pub embedding: Option<Vec<f32>>,
+}
+
+fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    b
+}
+
+pub fn blob_to_f32_vec(blob: Option<Vec<u8>>) -> Option<Vec<f32>> {
+    let b = blob?;
+    if b.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        out.push(f32::from_le_bytes(
+            chunk.try_into().ok()?,
+        ));
+    }
+    Some(out)
+}
+
+pub fn clear_schema_index_chunks(conn: &Connection, workspace_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM schema_index_chunks WHERE workspace_id = ?1",
+        params![workspace_id],
+    )?;
+    Ok(())
+}
+
+pub fn insert_schema_index_chunk(
+    conn: &Connection,
+    workspace_id: i64,
+    source_kind: &str,
+    source_ref: &str,
+    chunk_text: &str,
+    embedding: Option<&[f32]>,
+) -> rusqlite::Result<i64> {
+    let now = now_ms();
+    let blob = embedding.map(f32_slice_to_blob);
+    conn.execute(
+        r#"INSERT INTO schema_index_chunks (workspace_id, source_kind, source_ref, chunk_text, embedding, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+        params![
+            workspace_id,
+            source_kind,
+            source_ref,
+            chunk_text,
+            blob,
+            now,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_schema_index_chunks(
+    conn: &Connection,
+    workspace_id: i64,
+) -> rusqlite::Result<Vec<SchemaIndexChunk>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, source_kind, source_ref, chunk_text, embedding FROM schema_index_chunks WHERE workspace_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![workspace_id], |r| {
+        let emb_blob: Option<Vec<u8>> = r.get(4)?;
+        Ok(SchemaIndexChunk {
+            id: r.get(0)?,
+            source_kind: r.get(1)?,
+            source_ref: r.get(2)?,
+            chunk_text: r.get(3)?,
+            embedding: blob_to_f32_vec(emb_blob),
+        })
+    })?;
+    rows.collect()
 }
 
 fn now_ms() -> i64 {
@@ -171,12 +268,93 @@ pub fn update_workspace_model(conn: &Connection, id: i64, model: Option<&str>) -
     Ok(())
 }
 
+pub fn update_workspace_name(conn: &Connection, id: i64, name: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE workspaces SET name = ?1 WHERE id = ?2",
+        params![name, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_workspace_root_path(conn: &Connection, id: i64, root_path: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE workspaces SET root_path = ?1 WHERE id = ?2",
+        params![root_path, id],
+    )?;
+    Ok(())
+}
+
 pub fn delete_workspace(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
     Ok(())
 }
 
-/// Scan disk for .sql / .ddl, upsert sql_files, return file contents for parsing.
+fn is_sql_or_ddl_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            e == "sql" || e == "ddl"
+        })
+        .unwrap_or(false)
+}
+
+/// Skip heavy / non-SQL subtrees when scanning a folder workspace.
+fn should_skip_subdir(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules"
+            | ".git"
+            | "target"
+            | "dist"
+            | ".venv"
+            | "__pycache__"
+            | ".next"
+            | "build"
+    )
+}
+
+fn rel_path_from_root(root: &Path, file: &Path) -> String {
+    file.strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// All `.sql` / `.ddl` files under `root_dir`, depth-first stack walk, sorted by relative path.
+fn collect_sql_ddl_under(root_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut found = Vec::new();
+    let mut stack = vec![root_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if should_skip_subdir(name) {
+                        continue;
+                    }
+                }
+                stack.push(path);
+            } else if ft.is_file() && is_sql_or_ddl_file(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort_by(|a, b| rel_path_from_root(root_dir, a).cmp(&rel_path_from_root(root_dir, b)));
+    Ok(found)
+}
+
+/// Load one `.sql` / `.ddl` file, **or** every `.sql` / `.ddl` under a directory (e.g. `db/migrations/`).
+/// `workspaces.root_path` is the absolute file or folder path. Files are merged in **lexicographic
+/// order of relative path** (`001_…` before `002_…` when zero-padded). Same table name in a later file
+/// overwrites earlier definitions in the in-memory merge (`buildSchemaFromFiles`).
 pub fn rescan_workspace_files(
     conn: &Connection,
     workspace_id: i64,
@@ -184,25 +362,46 @@ pub fn rescan_workspace_files(
     let ws = get_workspace(conn, workspace_id)?
         .ok_or_else(|| format!("workspace {} not found", workspace_id))?;
     let root = Path::new(&ws.root_path);
-    if !root.is_dir() {
-        return Err(format!("root not a directory: {}", ws.root_path).into());
+    if !root.exists() {
+        return Err(format!("path does not exist: {}", ws.root_path).into());
     }
 
-    let mut out: Vec<FileContent> = Vec::new();
-    let mut seen_paths: Vec<String> = Vec::new();
+    let indexed: Vec<(String, PathBuf)> = if root.is_dir() {
+        let paths = collect_sql_ddl_under(root)?;
+        if paths.is_empty() {
+            return Err(format!(
+                "no .sql or .ddl files found under directory: {}",
+                ws.root_path
+            )
+            .into());
+        }
+        paths
+            .into_iter()
+            .map(|p| (rel_path_from_root(root, &p), p))
+            .collect()
+    } else if root.is_file() {
+        if !is_sql_or_ddl_file(root) {
+            let ext = root
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            return Err(format!("only .sql and .ddl files are supported (got .{ext})").into());
+        }
+        let rel_str = root
+            .file_name()
+            .map(|n| n.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| "schema.sql".into());
+        vec![(rel_str, root.to_path_buf())]
+    } else {
+        return Err(format!("not a file or directory: {}", ws.root_path).into());
+    };
 
-    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-        if ext != "sql" && ext != "ddl" {
-            continue;
-        }
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        let meta = std::fs::metadata(path)?;
+    let mut out: Vec<FileContent> = Vec::with_capacity(indexed.len());
+    let mut seen_rel: HashSet<String> = HashSet::new();
+
+    for (rel_str, full_path) in &indexed {
+        seen_rel.insert(rel_str.clone());
+        let meta = std::fs::metadata(full_path)?;
         let mtime_ms = meta
             .modified()
             .ok()
@@ -220,12 +419,12 @@ pub fn rescan_workspace_files(
             params![workspace_id, rel_str, mtime_ms, size_bytes],
         )?;
 
-        let content = std::fs::read_to_string(path).unwrap_or_else(|_| {
-            String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
+        let content = std::fs::read_to_string(full_path).unwrap_or_else(|_| {
+            String::from_utf8_lossy(&std::fs::read(full_path).unwrap_or_default()).into_owned()
         });
-        seen_paths.push(rel_str.clone());
+
         out.push(FileContent {
-            relative_path: rel_str,
+            relative_path: rel_str.clone(),
             content,
             mtime_ms,
         });
@@ -236,11 +435,11 @@ pub fn rescan_workspace_files(
         let rows = stmt.query_map(params![workspace_id], |r| r.get::<_, String>(0))?;
         rows.filter_map(|r| r.ok()).collect()
     };
-    for path in existing {
-        if !seen_paths.contains(&path) {
+    for p in existing {
+        if !seen_rel.contains(&p) {
             conn.execute(
                 "DELETE FROM sql_files WHERE workspace_id = ?1 AND relative_path = ?2",
-                params![workspace_id, path],
+                params![workspace_id, p],
             )?;
         }
     }
@@ -345,6 +544,7 @@ pub struct LoadedTable {
 #[serde(rename_all = "camelCase")]
 pub struct LoadedColumn {
     pub name: String,
+    #[serde(rename = "type")]
     pub r#type: String,
     pub nullable: bool,
     #[serde(rename = "isPk")]
@@ -476,6 +676,26 @@ pub fn list_chat_sessions(conn: &Connection, workspace_id: i64) -> rusqlite::Res
         })
     })?;
     rows.collect()
+}
+
+pub fn update_chat_session_title(conn: &Connection, session_id: i64, title: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE chat_sessions SET title = ?1 WHERE id = ?2",
+        params![title, session_id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_chat_session_for_workspace(
+    conn: &Connection,
+    workspace_id: i64,
+    session_id: i64,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM chat_sessions WHERE id = ?1 AND workspace_id = ?2",
+        params![session_id, workspace_id],
+    )?;
+    Ok(n > 0)
 }
 
 pub fn append_chat_message(

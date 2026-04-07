@@ -1,8 +1,38 @@
 import { listen } from "@tauri-apps/api/event";
 import { message, open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Database,
+  FileCode2,
+  FolderPlus,
+  MessageSquare,
+  Pencil,
+  RefreshCw,
+  Trash2,
+  X,
+} from "lucide-react";
 import { ChatPanel } from "./components/ChatPanel";
+import { SchemaDiagram } from "./components/SchemaDiagram";
 import { SchemaTree } from "./components/SchemaTree";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import { cn } from "@/lib/utils";
 import type { Dialect, LoadedTable, Workspace, WorkspaceSchemaStats } from "./lib/api";
 import {
   createWorkspace,
@@ -10,11 +40,26 @@ import {
   getWorkspaceSchemaStats,
   listWorkspaces,
   loadParsedSchema,
+  rebuildSchemaVectorIndex,
   rescanWorkspace,
   saveParsedSchema,
+  updateWorkspace,
   updateWorkspaceDialect,
 } from "./lib/api";
 import { buildSchemaFromFiles } from "./lib/parseSchema";
+
+type SchemaIndexProgressPayload = {
+  workspaceId: number;
+  phase: string;
+  current: number;
+  total: number;
+  message?: string | null;
+};
+
+type SchemaIndexErrorPayload = {
+  workspaceId: number;
+  message: string;
+};
 
 const DIALECTS: Dialect[] = [
   "postgresql",
@@ -31,8 +76,18 @@ export default function App() {
   const [schemaStats, setSchemaStats] = useState<WorkspaceSchemaStats | null>(
     null,
   );
-  const [wsName, setWsName] = useState("My workspace");
   const [scanning, setScanning] = useState(false);
+  const [workspaceModal, setWorkspaceModal] = useState<
+    null | { mode: "create" } | { mode: "edit" }
+  >(null);
+  const [modalWorkspaceName, setModalWorkspaceName] = useState("");
+  const [schemaOpen, setSchemaOpen] = useState(false);
+  const [schemaPanelTab, setSchemaPanelTab] = useState<"tree" | "diagram">(
+    "tree",
+  );
+  const [vectorIndex, setVectorIndex] = useState<SchemaIndexProgressPayload | null>(
+    null,
+  );
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -56,6 +111,18 @@ export default function App() {
   useEffect(() => {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
+
+  useEffect(() => {
+    if (!schemaOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setSchemaOpen(false);
+        setSchemaPanelTab("tree");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [schemaOpen]);
 
   const loadStats = useCallback(async (wsId: number) => {
     try {
@@ -86,6 +153,7 @@ export default function App() {
         await saveParsedSchema(wsId, schema);
         await loadParsedSchema(wsId).then(setTables);
         await loadStats(wsId);
+        void rebuildSchemaVectorIndex(wsId).catch(() => {});
       } finally {
         setScanning(false);
       }
@@ -96,6 +164,49 @@ export default function App() {
   useEffect(() => {
     if (activeId != null) void loadTables(activeId);
   }, [activeId, loadTables]);
+
+  useEffect(() => {
+    let unProgress: (() => void) | undefined;
+    let unErr: (() => void) | undefined;
+    void listen<SchemaIndexProgressPayload>("schema-index-progress", (ev) => {
+      setVectorIndex(ev.payload);
+      if (ev.payload.phase === "done") {
+        window.setTimeout(() => {
+          setVectorIndex((prev) =>
+            prev?.workspaceId === ev.payload.workspaceId &&
+            prev?.phase === "done"
+              ? null
+              : prev,
+          );
+        }, 5000);
+      }
+    }).then((fn) => {
+      unProgress = fn;
+    });
+    void listen<SchemaIndexErrorPayload>("schema-index-error", (ev) => {
+      setVectorIndex({
+        workspaceId: ev.payload.workspaceId,
+        phase: "error",
+        current: 0,
+        total: 0,
+        message: ev.payload.message,
+      });
+    }).then((fn) => {
+      unErr = fn;
+    });
+    return () => {
+      unProgress?.();
+      unErr?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeId == null) return;
+    const t = window.setTimeout(() => {
+      void rebuildSchemaVectorIndex(activeId).catch(() => {});
+    }, 1200);
+    return () => window.clearTimeout(t);
+  }, [activeId]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -129,18 +240,40 @@ export default function App() {
     return null;
   }
 
-  async function pickFolderAndCreate() {
+  function openCreateWorkspaceModal() {
+    setModalWorkspaceName("My workspace");
+    setWorkspaceModal({ mode: "create" });
+  }
+
+  function openEditWorkspaceModal() {
+    if (!active) return;
+    setModalWorkspaceName(active.name);
+    setWorkspaceModal({ mode: "edit" });
+  }
+
+  function closeWorkspaceModal() {
+    setWorkspaceModal(null);
+  }
+
+  const sqlFileDialogFilters = [
+    { name: "SQL", extensions: ["sql", "ddl"] as string[] },
+  ];
+
+  async function pickSqlFileAndCreateFromModal() {
+    if (workspaceModal?.mode !== "create") return;
     try {
       const raw = await open({
-        directory: true,
+        directory: false,
         multiple: false,
-        title: "Choose SQL / DDL folder",
+        filters: sqlFileDialogFilters,
+        title: "Choose SQL or DDL file",
       });
       const selected = normalizeDialogPath(raw);
       if (!selected) return;
 
-      const nm = wsName.trim() || "Workspace";
+      const nm = modalWorkspaceName.trim() || "Workspace";
       const ws = await createWorkspace(nm, selected);
+      closeWorkspaceModal();
       await refreshWorkspaces();
       setActiveId(ws.id);
 
@@ -160,6 +293,130 @@ export default function App() {
     }
   }
 
+  async function pickSqlFolderAndCreateFromModal() {
+    if (workspaceModal?.mode !== "create") return;
+    try {
+      const raw = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose folder containing .sql / .ddl (e.g. migrations)",
+      });
+      const selected = normalizeDialogPath(raw);
+      if (!selected) return;
+
+      const nm = modalWorkspaceName.trim() || "Workspace";
+      const ws = await createWorkspace(nm, selected);
+      closeWorkspaceModal();
+      await refreshWorkspaces();
+      setActiveId(ws.id);
+
+      try {
+        await runRescan(ws.id, ws.dialect as Dialect);
+      } catch (scanErr) {
+        await message(
+          `Workspace was created, but the folder scan failed:\n\n${String(scanErr)}`,
+          { title: "Scan failed", kind: "warning" },
+        );
+      }
+    } catch (e) {
+      await message(String(e), {
+        title: "Could not create workspace",
+        kind: "error",
+      });
+    }
+  }
+
+  async function saveEditedWorkspaceName() {
+    if (workspaceModal?.mode !== "edit" || !active) return;
+    const nm = modalWorkspaceName.trim();
+    if (!nm) {
+      await message("Please enter a workspace name.", {
+        title: "Name required",
+        kind: "warning",
+      });
+      return;
+    }
+    try {
+      await updateWorkspace(active.id, { name: nm });
+      closeWorkspaceModal();
+      await refreshWorkspaces();
+    } catch (e) {
+      await message(String(e), {
+        title: "Could not update workspace",
+        kind: "error",
+      });
+    }
+  }
+
+  async function pickSqlFileAndUpdateWorkspace() {
+    if (workspaceModal?.mode !== "edit" || !active) return;
+    try {
+      const raw = await open({
+        directory: false,
+        multiple: false,
+        filters: sqlFileDialogFilters,
+        title: "Choose new SQL or DDL file",
+      });
+      const selected = normalizeDialogPath(raw);
+      if (!selected) return;
+
+      const nm = modalWorkspaceName.trim();
+      await updateWorkspace(active.id, {
+        rootPath: selected,
+        ...(nm ? { name: nm } : {}),
+      });
+      closeWorkspaceModal();
+      await refreshWorkspaces();
+      try {
+        await runRescan(active.id, dialect);
+      } catch (scanErr) {
+        await message(
+          `SQL root was updated, but rescan failed:\n\n${String(scanErr)}`,
+          { title: "Scan failed", kind: "warning" },
+        );
+      }
+    } catch (e) {
+      await message(String(e), {
+        title: "Could not update SQL file",
+        kind: "error",
+      });
+    }
+  }
+
+  async function pickSqlFolderAndUpdateWorkspace() {
+    if (workspaceModal?.mode !== "edit" || !active) return;
+    try {
+      const raw = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose folder with .sql / .ddl files",
+      });
+      const selected = normalizeDialogPath(raw);
+      if (!selected) return;
+
+      const nm = modalWorkspaceName.trim();
+      await updateWorkspace(active.id, {
+        rootPath: selected,
+        ...(nm ? { name: nm } : {}),
+      });
+      closeWorkspaceModal();
+      await refreshWorkspaces();
+      try {
+        await runRescan(active.id, dialect);
+      } catch (scanErr) {
+        await message(
+          `SQL root was updated, but rescan failed:\n\n${String(scanErr)}`,
+          { title: "Scan failed", kind: "warning" },
+        );
+      }
+    } catch (e) {
+      await message(String(e), {
+        title: "Could not update SQL folder",
+        kind: "error",
+      });
+    }
+  }
+
   async function onDialectChange(next: Dialect) {
     if (!active) return;
     await updateWorkspaceDialect(active.id, next);
@@ -174,112 +431,383 @@ export default function App() {
     await refreshWorkspaces();
   }
 
-  if (!workspaces.length) {
-    return (
-      <div className="flex min-h-full flex-col items-center justify-center gap-6 px-6">
-        <div className="max-w-lg text-center">
-          <h1 className="text-2xl font-semibold tracking-tight text-white">
-            Chat-to-SQL
-          </h1>
-          <p className="mt-2 text-sm text-slate-400">
-            Offline-friendly schema chat: pick a folder of{" "}
-            <code className="text-cyan-400">.sql</code> /{" "}
-            <code className="text-cyan-400">.ddl</code> files, parse{" "}
-            <code className="text-cyan-400">CREATE TABLE</code>, then ask a
-            local Ollama model for queries. Your DDL stays on disk; only you
-            choose what gets sent to the model.
-          </p>
-        </div>
-        <div className="flex w-full max-w-md flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-6">
-          <label className="text-xs font-medium text-slate-500">
-            Workspace name
-          </label>
-          <input
-            className="rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
-            value={wsName}
-            onChange={(e) => setWsName(e.target.value)}
-            placeholder="e.g. Acme warehouse"
-          />
-          <button
-            type="button"
-            className="rounded-lg bg-cyan-600 py-2.5 text-sm font-medium text-white hover:bg-cyan-500"
-            onClick={() => void pickFolderAndCreate()}
+  const workspaceModalOverlay =
+    workspaceModal != null ? (
+      <div
+        className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50 p-4"
+        role="presentation"
+        onClick={() => closeWorkspaceModal()}
+      >
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="ws-modal-title"
+          className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-lg"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <h2
+            id="ws-modal-title"
+            className="font-heading text-lg font-semibold text-foreground"
           >
-            Choose folder…
-          </button>
-          <p className="text-center text-xs text-slate-500">
-            Requires Ollama on <code className="text-slate-400">localhost:11434</code>{" "}
-            for chat (Phase 2).
+            {workspaceModal.mode === "create"
+              ? "New workspace"
+              : "Edit workspace"}
+          </h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {workspaceModal.mode === "create"
+              ? "Choose one .sql/.ddl file (e.g. DBeaver export), or a folder (e.g. db/migrations). Folders are scanned for all .sql/.ddl files, ordered by path."
+              : "Rename the workspace or point to a different SQL file or folder."}
           </p>
+          <div className="mt-4 space-y-2">
+            <label
+              htmlFor="modal-ws-name"
+              className="text-xs font-medium text-muted-foreground"
+            >
+              Workspace name
+            </label>
+            <Input
+              id="modal-ws-name"
+              value={modalWorkspaceName}
+              onChange={(e) => setModalWorkspaceName(e.target.value)}
+              placeholder="e.g. Acme warehouse"
+              autoFocus
+            />
+          </div>
+          {workspaceModal.mode === "edit" && active ? (
+            <p
+              className="mt-3 break-all text-[11px] leading-snug text-muted-foreground"
+              title={active.rootPath}
+            >
+              SQL root (file or folder):{" "}
+              <span className="font-mono text-foreground/80">
+                {active.rootPath}
+              </span>
+            </p>
+          ) : null}
+          <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => closeWorkspaceModal()}
+            >
+              Cancel
+            </Button>
+            {workspaceModal.mode === "create" ? (
+              <>
+                <Button
+                  type="button"
+                  onClick={() => void pickSqlFileAndCreateFromModal()}
+                >
+                  <FileCode2 className="size-4" />
+                  Choose SQL file…
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => void pickSqlFolderAndCreateFromModal()}
+                >
+                  <FolderPlus className="size-4" />
+                  Choose SQL folder…
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => void pickSqlFileAndUpdateWorkspace()}
+                >
+                  <FileCode2 className="size-4" />
+                  Change SQL file…
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => void pickSqlFolderAndUpdateWorkspace()}
+                >
+                  <FolderPlus className="size-4" />
+                  Change SQL folder…
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => void saveEditedWorkspaceName()}
+                >
+                  Save name
+                </Button>
+              </>
+            )}
+          </div>
         </div>
       </div>
+    ) : null;
+
+  if (!workspaces.length) {
+    return (
+      <>
+        <div className="flex min-h-full flex-col items-center justify-center gap-8 px-6 py-12">
+          <div className="w-full max-w-md text-center">
+            <h1 className="font-heading text-2xl font-semibold tracking-tight text-foreground">
+              Chat-to-SQL
+            </h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Offline-friendly schema chat: point a workspace at one{" "}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
+                .sql
+              </code>{" "}
+              /{" "}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
+                .ddl
+              </code>{" "}
+              file or a folder of migration scripts. We parse{" "}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
+                CREATE TABLE
+              </code>{" "}
+              (and merge files in path order), then you can ask a local Ollama model for queries.
+            </p>
+          </div>
+          <Card className="w-full max-w-md">
+            <CardHeader>
+              <CardTitle>Get started</CardTitle>
+              <CardDescription>
+                Requires Ollama on{" "}
+                <span className="font-mono text-foreground/80">
+                  localhost:11434
+                </span>{" "}
+                for chat.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button
+                type="button"
+                className="w-full"
+                onClick={() => openCreateWorkspaceModal()}
+              >
+                <FolderPlus className="size-4" />
+                Create workspace…
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+        {workspaceModalOverlay}
+      </>
     );
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-slate-800 px-3 py-2">
-        <span className="font-semibold text-cyan-400">Chat-to-SQL</span>
-        <label className="text-xs text-slate-500">Workspace</label>
-        <select
-          className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm"
-          value={activeId ?? ""}
-          onChange={(e) => setActiveId(Number(e.target.value))}
-        >
-          {workspaces.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.name}
-            </option>
-          ))}
-        </select>
-        <label className="text-xs text-slate-500">SQL dialect</label>
-        <select
-          className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm"
-          value={dialect}
-          onChange={(e) => void onDialectChange(e.target.value as Dialect)}
-        >
-          {DIALECTS.map((d) => (
-            <option key={d} value={d}>
-              {d}
-            </option>
-          ))}
-        </select>
-        <button
-          type="button"
-          disabled={scanning || !active}
-          className="rounded bg-slate-700 px-2 py-1 text-xs hover:bg-slate-600 disabled:opacity-40"
-          onClick={() => active && void runRescan(active.id, dialect)}
-        >
-          {scanning ? "Scanning…" : "Rescan files"}
-        </button>
-        <button
-          type="button"
-          className="ml-auto rounded border border-red-900/60 px-2 py-1 text-xs text-red-300 hover:bg-red-950/40"
-          onClick={() => void removeWorkspace()}
-        >
-          Remove workspace
-        </button>
-      </header>
-      <div className="flex min-h-0 flex-1">
-        <aside className="flex w-72 shrink-0 flex-col border-r border-slate-800 bg-slate-900/30">
-          <div className="border-b border-slate-800 px-2 py-2">
-            <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Schema
-            </h2>
-            {active && (
-              <p className="mt-1 truncate text-[11px] text-slate-500" title={active.rootPath}>
-                {active.rootPath}
-              </p>
-            )}
+    <div className="flex h-full min-h-0 w-full bg-background text-foreground">
+      <aside className="flex w-[260px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
+        <div className="flex flex-col gap-2 p-3">
+          <div className="flex items-center gap-2 px-1">
+            <MessageSquare className="size-5 text-sidebar-primary" />
+            <span className="font-heading text-sm font-semibold tracking-tight">
+              Chat-to-SQL
+            </span>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto p-2">
-            <SchemaTree tables={tables} stats={schemaStats} />
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full justify-start gap-2 border-sidebar-border bg-sidebar-accent/30 hover:bg-sidebar-accent/50"
+            onClick={() => openCreateWorkspaceModal()}
+          >
+            <FolderPlus className="size-4" />
+            New workspace
+          </Button>
+        </div>
+        <Separator className="bg-sidebar-border" />
+        <div className="px-3 pt-2 pb-1">
+          <p className="px-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+            Workspaces
+          </p>
+        </div>
+        <ScrollArea className="min-h-0 flex-1 px-2">
+          <nav className="flex flex-col gap-0.5 pb-3">
+            {workspaces.map((w) => (
+              <button
+                key={w.id}
+                type="button"
+                onClick={() => setActiveId(w.id)}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-sm transition-colors",
+                  activeId === w.id
+                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                    : "text-sidebar-foreground/90 hover:bg-sidebar-accent/40",
+                )}
+              >
+                <span className="min-w-0 flex-1 truncate font-medium">
+                  {w.name}
+                </span>
+              </button>
+            ))}
+          </nav>
+        </ScrollArea>
+        <Separator className="bg-sidebar-border" />
+        <div className="space-y-3 p-3">
+          <div className="space-y-1.5">
+            <p className="px-0.5 text-[11px] font-medium text-muted-foreground">
+              SQL dialect
+            </p>
+            <Select
+              value={dialect}
+              onValueChange={(v) => void onDialectChange(v as Dialect)}
+              disabled={!active}
+            >
+              <SelectTrigger className="h-9 w-full bg-sidebar-accent/20">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {DIALECTS.map((d) => (
+                  <SelectItem key={d} value={d}>
+                    {d}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
-        </aside>
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="text-sidebar-foreground/80"
+              title="Edit workspace"
+              disabled={!active}
+              onClick={() => openEditWorkspaceModal()}
+            >
+              <Pencil className="size-4" />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="text-sidebar-foreground/80"
+              title="Rescan files"
+              disabled={scanning || !active}
+              onClick={() => active && void runRescan(active.id, dialect)}
+            >
+              <RefreshCw className={cn("size-4", scanning && "animate-spin")} />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="text-sidebar-foreground/80"
+              title="Schema"
+              disabled={!active}
+              onClick={() => setSchemaOpen(true)}
+            >
+              <Database className="size-4" />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="text-destructive hover:bg-destructive/15 hover:text-destructive"
+              title="Remove workspace"
+              disabled={!active}
+              onClick={() => void removeWorkspace()}
+            >
+              <Trash2 className="size-4" />
+            </Button>
+          </div>
+          {active && (
+            <p
+              className="line-clamp-2 break-all text-[10px] leading-snug text-muted-foreground"
+              title={active.rootPath}
+            >
+              {active.rootPath}
+            </p>
+          )}
+        </div>
+      </aside>
+
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {active && vectorIndex && vectorIndex.workspaceId === active.id && (
+            <div
+              className={`shrink-0 border-b px-3 py-1.5 text-xs ${
+                vectorIndex.phase === "error"
+                  ? "border-destructive/40 bg-destructive/10 text-destructive"
+                  : vectorIndex.phase === "done"
+                    ? "border-border bg-muted/60 text-muted-foreground"
+                    : "border-border bg-muted/50 text-muted-foreground"
+              }`}
+            >
+              {vectorIndex.phase === "error"
+                ? `Vector index: ${vectorIndex.message ?? "error"}`
+                : (vectorIndex.message ??
+                  `Indexing schema… ${vectorIndex.current}/${vectorIndex.total}`)}
+            </div>
+          )}
         {active && (
           <ChatPanel workspace={active} tables={tables} dialect={dialect} />
         )}
       </div>
+
+      {schemaOpen && (
+        <div
+          className="fixed inset-0 z-[300] flex flex-col bg-background"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="schema-panel-title"
+        >
+          <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-3">
+            <div className="min-w-0 flex-1">
+              <h2
+                id="schema-panel-title"
+                className="font-heading text-lg font-semibold tracking-tight text-foreground"
+              >
+                Schema
+              </h2>
+              <p className="text-sm text-muted-foreground">
+                Parsed tables and foreign keys from your SQL root (single file or merged folder).
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant={schemaPanelTab === "tree" ? "secondary" : "ghost"}
+                size="sm"
+                className="h-9"
+                onClick={() => setSchemaPanelTab("tree")}
+              >
+                Tables
+              </Button>
+              <Button
+                type="button"
+                variant={schemaPanelTab === "diagram" ? "secondary" : "ghost"}
+                size="sm"
+                className="h-9"
+                onClick={() => setSchemaPanelTab("diagram")}
+              >
+                Diagram
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon-sm"
+                className="shrink-0"
+                aria-label="Close schema"
+                onClick={() => {
+                  setSchemaOpen(false);
+                  setSchemaPanelTab("tree");
+                }}
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+          </header>
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            {schemaPanelTab === "tree" ? (
+              <ScrollArea className="h-full min-h-0 flex-1 px-4 py-4">
+                <SchemaTree tables={tables} stats={schemaStats} />
+              </ScrollArea>
+            ) : (
+              <SchemaDiagram tables={tables} fullViewport />
+            )}
+          </div>
+        </div>
+      )}
+
+      {workspaceModalOverlay}
     </div>
   );
 }

@@ -85,12 +85,104 @@ function columnRefName(col: unknown): string {
   return "?";
 }
 
+/** True when exprToSQL produced nothing useful (common for PG/MySQL `dataType` AST). */
+function isUnusableTypeSql(s: string): boolean {
+  const t = s.trim();
+  if (!t) return true;
+  if (t === "()" || t === "( )") return true;
+  return /^\(\s*\)$/.test(t);
+}
+
+/**
+ * Build type text from node-sql-parser column `definition` when it uses `{ dataType, length, suffix, … }`
+ * (PostgreSQL, MySQL) — `exprToSQL` often returns "" or "()".
+ */
+function dataTypeFromDataTypeAst(def: Record<string, unknown>): string {
+  const raw = def.dataType;
+  if (typeof raw !== "string") return "";
+
+  const suffixRaw = def.suffix;
+  const suffixParts = Array.isArray(suffixRaw)
+    ? suffixRaw.map(String).filter(Boolean)
+    : [];
+
+  let out = raw.trim();
+  if (suffixParts.length) out = `${out} ${suffixParts.join(" ")}`;
+
+  if (def.parentheses) {
+    const len = def.length;
+    const scale = def.scale;
+    if (len !== undefined && len !== null) {
+      out +=
+        scale !== undefined && scale !== null
+          ? `(${len}, ${scale})`
+          : `(${len})`;
+    }
+  }
+
+  const arr = def.array as { dimension?: number } | undefined;
+  if (arr && typeof arr.dimension === "number" && arr.dimension > 0) {
+    if (!out.includes("[]")) {
+      out += "[]".repeat(arr.dimension);
+    }
+  }
+
+  return out.replace(/\s+/g, " ").trim();
+}
+
 function dataTypeString(dt: DataType, parser: Parser): string {
   try {
-    return parser.exprToSQL(dt).trim();
+    const fromParser = parser.exprToSQL(dt).trim();
+    if (!isUnusableTypeSql(fromParser)) return fromParser;
   } catch {
-    return JSON.stringify(dt);
+    // fall through
   }
+  if (dt && typeof dt === "object") {
+    const manual = dataTypeFromDataTypeAst(dt as Record<string, unknown>);
+    if (manual) return manual;
+  }
+  try {
+    return JSON.stringify(dt);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * REFERENCES target from a column definition or from CONSTRAINT FOREIGN KEY.
+ * Parser shape: `table: [{ db, table }]` and `definition` = referenced column list.
+ */
+function referenceTargetFromDefinition(ref: unknown): {
+  table: string;
+  columns: string[];
+} | null {
+  if (!ref || typeof ref !== "object") return null;
+  const r = ref as Record<string, unknown>;
+  const tableRaw = r.table;
+  let refTable = "";
+  if (Array.isArray(tableRaw) && tableRaw.length > 0) {
+    const first = tableRaw[0] as { table?: string } | undefined;
+    refTable = String(first?.table ?? "");
+  } else if (
+    tableRaw &&
+    typeof tableRaw === "object" &&
+    !Array.isArray(tableRaw) &&
+    "table" in (tableRaw as object)
+  ) {
+    refTable = String((tableRaw as { table?: string }).table ?? "");
+  }
+  const def = r.definition;
+  const refCols: string[] = Array.isArray(def)
+    ? def.map((x) => columnRefName(x))
+    : [];
+  if (!refTable) return null;
+  const cols = refCols.filter((c) => c && c !== "?");
+  return { table: refTable, columns: cols };
+}
+
+/** Strip SQL quotes / backticks from identifiers (FK target names). */
+function cleanIdent(name: string): string {
+  return name.replace(/^["`]+|["`]+$/g, "").trim();
 }
 
 function tableFromCreate(
@@ -109,19 +201,47 @@ function tableFromCreate(
 
   for (const def of defs as CreateDefinition[]) {
     if (def.resource === "column") {
-      const cd = def as CreateColumnDefinition;
+      const cd = def as CreateColumnDefinition & {
+        primary_key?: string;
+        reference_definition?: unknown;
+      };
       const colName = columnRefName(cd.column);
       const typeStr = dataTypeString(cd.definition, parser);
       const opt = cd as { nullable?: { value?: string }; null?: string };
       const nullable = !(
         opt.null === "not null" || opt.nullable?.value === "not null"
       );
+      const inlinePk =
+        cd.primary_key === "primary key" || cd.primary_key === "key";
+      if (inlinePk && colName && colName !== "?") {
+        primaryKeyCols.add(colName);
+      }
       columns.push({
         name: colName,
         type: typeStr,
         nullable,
         isPk: false,
       });
+
+      let colRef: unknown = cd.reference_definition;
+      if (
+        colRef &&
+        typeof colRef === "object" &&
+        "reference_definition" in colRef
+      ) {
+        colRef = (colRef as { reference_definition: unknown })
+          .reference_definition as unknown;
+      }
+      const refTarget = referenceTargetFromDefinition(colRef);
+      if (refTarget && colName && colName !== "?") {
+        const refCols =
+          refTarget.columns.length > 0 ? refTarget.columns : ["id"];
+        foreignKeys.push({
+          columns: [colName],
+          referencedTable: cleanIdent(refTarget.table),
+          referencedColumns: refCols.map(cleanIdent),
+        });
+      }
     } else if (def.resource === "constraint") {
       const ct = (def as { constraint_type?: string }).constraint_type;
       if (ct === "primary key") {
@@ -133,21 +253,14 @@ function tableFromCreate(
       } else if (ct === "FOREIGN KEY") {
         const fk = def as CreateConstraintForeign;
         const cols = (fk.definition ?? []).map((r) => columnRefName(r));
-        const refDef = fk.reference_definition as
-          | {
-              table?: { table?: string };
-              columns?: { column?: string }[];
-            }
-          | undefined;
-        const refTable = refDef?.table?.table ?? "";
-        const refCols = (refDef?.columns ?? []).map((r) =>
-          columnRefName(r as never),
-        );
-        if (cols.length && refTable) {
+        const refTarget = referenceTargetFromDefinition(fk.reference_definition);
+        if (cols.length && refTarget?.table) {
+          const refCols =
+            refTarget.columns.length > 0 ? refTarget.columns : ["id"];
           foreignKeys.push({
-            columns: cols,
-            referencedTable: refTable,
-            referencedColumns: refCols,
+            columns: cols.map(cleanIdent),
+            referencedTable: cleanIdent(refTarget.table),
+            referencedColumns: refCols.map(cleanIdent),
           });
         }
       }

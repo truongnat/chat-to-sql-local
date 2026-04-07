@@ -33,6 +33,7 @@ pub struct FileContent {
 #[serde(rename_all = "camelCase")]
 pub struct ParsedColumnPayload {
     pub name: String,
+    #[serde(rename = "type")]
     pub r#type: String,
     #[serde(default)]
     pub nullable: bool,

@@ -13,6 +13,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 fn spawn_ollama_serve_detached() -> std::io::Result<()> {
     let mut cmd = Command::new("ollama");
     cmd.arg("serve")
+        .env("OLLAMA_HOST", "127.0.0.1:11434")
+        .env("OLLAMA_ORIGINS", "127.0.0.1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -65,6 +67,8 @@ pub fn try_start_ollama() -> Result<String, String> {
                 .join("Ollama.exe");
             if exe.is_file() {
                 Command::new(&exe)
+                    .env("OLLAMA_HOST", "127.0.0.1:11434")
+                    .env("OLLAMA_ORIGINS", "127.0.0.1")
                     .spawn()
                     .map_err(|e| format!("Could not start {exe:?}: {e}"))?;
                 return Ok("Started Ollama from your user Programs folder.".into());

@@ -107,6 +107,17 @@ export interface ChatMessage {
   createdAt: number;
 }
 
+export interface VerifiedModel {
+  name: string;
+  displayName: string;
+  description: string;
+  parameterSize: string;
+}
+
+export function getVerifiedModels(): Promise<VerifiedModel[]> {
+  return invoke("get_verified_models");
+}
+
 export function createWorkspace(
   name: string,
   rootPath: string,

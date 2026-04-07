@@ -12,7 +12,33 @@ pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute("PRAGMA foreign_keys = ON", [])?;
     migrate(&conn)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            workspace_id INTEGER,
+            details TEXT,
+            FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
+        )",
+        [],
+    )?;
+
     Ok(conn)
+}
+
+pub fn log_audit_event(
+    conn: &Connection,
+    event_type: &str,
+    workspace_id: Option<i64>,
+    details: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO audit_logs (timestamp, event_type, workspace_id, details)
+         VALUES (strftime('%s','now') * 1000, ?, ?, ?)",
+        params![event_type, workspace_id, details],
+    )?;
+    Ok(())
 }
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -215,6 +241,7 @@ pub fn create_workspace(conn: &Connection, name: &str, root_path: &str) -> rusql
         params![name, root_path, created_at],
     )?;
     let id = conn.last_insert_rowid();
+    let _ = log_audit_event(conn, "WORKSPACE_CREATE", Some(id), Some(root_path));
     get_workspace(conn, id).map(|w| w.expect("inserted"))
 }
 
@@ -366,6 +393,8 @@ pub fn rescan_workspace_files(
         return Err(format!("path does not exist: {}", ws.root_path).into());
     }
 
+    let _ = log_audit_event(conn, "WORKSPACE_RESCAN_START", Some(workspace_id), None);
+
     let indexed: Vec<(String, PathBuf)> = if root.is_dir() {
         let paths = collect_sql_ddl_under(root)?;
         if paths.is_empty() {
@@ -398,17 +427,29 @@ pub fn rescan_workspace_files(
 
     let mut out: Vec<FileContent> = Vec::with_capacity(indexed.len());
     let mut seen_rel: HashSet<String> = HashSet::new();
+    let max_size = 10 * 1024 * 1024; // 10MB
 
     for (rel_str, full_path) in &indexed {
         seen_rel.insert(rel_str.clone());
         let meta = std::fs::metadata(full_path)?;
+        let size_bytes = meta.len() as i64;
+
+        if size_bytes > max_size {
+            let _ = log_audit_event(
+                conn,
+                "FILE_SKIPPED_TOO_LARGE",
+                Some(workspace_id),
+                Some(&rel_str),
+            );
+            continue;
+        }
+
         let mtime_ms = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let size_bytes = meta.len() as i64;
 
         conn.execute(
             r#"INSERT INTO sql_files (workspace_id, relative_path, mtime_ms, size_bytes)
@@ -443,6 +484,8 @@ pub fn rescan_workspace_files(
             )?;
         }
     }
+
+    let _ = log_audit_event(conn, "WORKSPACE_RESCAN_END", Some(workspace_id), None);
 
     Ok(out)
 }
@@ -710,6 +753,18 @@ pub fn append_chat_message(
         params![session_id, role, content, created_at],
     )?;
     let id = conn.last_insert_rowid();
+
+    if role == "user" {
+        let ws_id: Option<i64> = conn
+            .query_row(
+                "SELECT workspace_id FROM chat_sessions WHERE id = ?",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let _ = log_audit_event(conn, "CHAT_MESSAGE", ws_id, Some("User sent message"));
+    }
+
     Ok(ChatMessage {
         id,
         session_id,

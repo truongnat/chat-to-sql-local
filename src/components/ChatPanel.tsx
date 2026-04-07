@@ -13,12 +13,14 @@ import type {
   ChatMessage,
   ChatSession,
   LoadedTable,
+  VerifiedModel,
   Workspace,
 } from "../lib/api";
 import {
   appendChatMessage,
   createChatSession,
   deleteChatSession,
+  getVerifiedModels,
   installOllamaFromDownload,
   listChatMessages,
   listChatSessions,
@@ -40,13 +42,11 @@ import {
 import {
   DEFAULT_SUGGESTED_MODEL,
   OLLAMA_MODEL_SIZE_HINT_BYTES,
-  OLLAMA_MODEL_SUGGESTIONS,
 } from "../lib/ollamaModelSuggestions";
 import type { OllamaModel, OllamaRunningModel } from "../lib/ollama";
 import {
   chatStream,
   listModels,
-  listOllamaLibraryCatalog,
   listRunningModels,
   ollamaHealth,
   pullModelStream,
@@ -54,11 +54,10 @@ import {
 } from "../lib/ollama";
 import { cn } from "@/lib/utils";
 
-/** `local` = installed on this machine; `catalog` = ollama.com library entry (size / metadata for pull UI). */
+/** `local` = installed on this machine. */
 type ModelPickerRow = {
   name: string;
   local?: OllamaModel;
-  catalog?: OllamaModel;
 };
 
 function fmtBytes(n: number): string {
@@ -102,10 +101,7 @@ export function ChatPanel({
 }) {
   const [ollamaOk, setOllamaOk] = useState<boolean | null>(null);
   const [ollamaTagsError, setOllamaTagsError] = useState<string | null>(null);
-  const [libraryCatalogError, setLibraryCatalogError] = useState<string | null>(
-    null,
-  );
-  const [libraryCatalog, setLibraryCatalog] = useState<OllamaModel[]>([]);
+  const [verifiedModels, setVerifiedModels] = useState<VerifiedModel[]>([]);
   const [localModels, setLocalModels] = useState<OllamaModel[]>([]);
   const [runningModels, setRunningModels] = useState<OllamaRunningModel[]>([]);
   const [model, setModel] = useState(
@@ -135,14 +131,12 @@ export function ChatPanel({
     const ok = await ollamaHealth();
     setOllamaOk(ok);
 
-    const libPromise = listOllamaLibraryCatalog()
-      .then((lib) => {
-        setLibraryCatalog(lib);
-        setLibraryCatalogError(null);
-      })
-      .catch((e) => {
-        setLibraryCatalogError(String(e));
-      });
+    try {
+      const verified = await getVerifiedModels();
+      setVerifiedModels(verified);
+    } catch {
+      /* ignore */
+    }
 
     if (ok) {
       try {
@@ -169,8 +163,6 @@ export function ChatPanel({
       setRunningModels([]);
       setOllamaTagsError(null);
     }
-
-    await libPromise;
   }, []);
 
   useEffect(() => {
@@ -191,11 +183,6 @@ export function ChatPanel({
   }, [runningModels]);
 
   const mergedPickerRows = useMemo((): ModelPickerRow[] => {
-    const catalogByName = new Map<string, OllamaModel>();
-    for (const c of libraryCatalog) {
-      if (c.name) catalogByName.set(c.name, c);
-    }
-
     const sorted = sortLocalModelsForPicker(localModels, runningNames);
     const seen = new Set<string>();
     const rows: ModelPickerRow[] = [];
@@ -207,26 +194,18 @@ export function ChatPanel({
       rows.push({
         name: n,
         local: m,
-        catalog: catalogByName.get(n),
       });
     }
 
-    for (const lib of libraryCatalog) {
-      const n = lib.name;
+    for (const v of verifiedModels) {
+      const n = v.name;
       if (!n || seen.has(n)) continue;
       seen.add(n);
-      rows.push({ name: n, catalog: lib });
-    }
-
-    for (const n of OLLAMA_MODEL_SUGGESTIONS) {
-      if (!n || seen.has(n)) continue;
-      seen.add(n);
-      const cat = catalogByName.get(n);
-      rows.push(cat ? { name: n, catalog: cat } : { name: n });
+      rows.push({ name: n });
     }
 
     return rows;
-  }, [localModels, runningNames, libraryCatalog]);
+  }, [localModels, runningNames, verifiedModels]);
 
   const modelPickerRows = useMemo(() => {
     const q = modelSearch.trim().toLowerCase();
@@ -790,25 +769,19 @@ export function ChatPanel({
                       {ollamaTagsError}
                     </li>
                   ) : null}
-                  {libraryCatalogError ? (
-                    <li className="px-3 py-1.5 text-[11px] text-amber-200/80">
-                      Library list unavailable (ollama.com/api/tags):{" "}
-                      {libraryCatalogError}
-                    </li>
-                  ) : null}
                   {modelPickerRows.length === 0 ? (
                     <li className="px-3 py-2 text-xs text-slate-500">No matches</li>
                   ) : (
-                    modelPickerRows.map(({ name, local: loc, catalog: cat }) => {
+                    modelPickerRows.map(({ name, local: loc }) => {
                       const installed = loc != null;
                       const active = model === name;
                       const busy = pullingName === name;
                       const run = runningByName.get(name);
+                      const verified = verifiedModels.find((v) => v.name === name);
+
                       const metaParts = [
-                        loc?.details?.parameter_size ??
-                          cat?.details?.parameter_size,
-                        loc?.details?.quantization_level ??
-                          cat?.details?.quantization_level,
+                        loc?.details?.parameter_size || verified?.parameterSize,
+                        loc?.details?.quantization_level,
                       ].filter(Boolean);
                       if (run?.size_vram != null) {
                         metaParts.push(`${fmtBytes(run.size_vram)} VRAM`);
@@ -820,19 +793,15 @@ export function ChatPanel({
                       const diskBytes =
                         loc != null && loc.size > 0
                           ? loc.size
-                          : cat != null && cat.size > 0
-                            ? cat.size
-                            : hintBytes != null
-                              ? hintBytes
-                              : null;
+                          : hintBytes != null
+                            ? hintBytes
+                            : null;
                       const sizeTitle =
                         loc != null && loc.size > 0
                           ? "Installed size (local)"
-                          : cat != null && cat.size > 0
-                            ? "Catalog size (ollama.com)"
-                            : hintBytes != null
-                              ? "Approximate hint"
-                              : "Unknown until pulled";
+                          : hintBytes != null
+                            ? "Approximate hint"
+                            : "Unknown until pulled";
                       return (
                         <li
                           key={name}
@@ -841,6 +810,7 @@ export function ChatPanel({
                           }`}
                           role="option"
                           aria-selected={active}
+                          title={verified?.description}
                         >
                           <button
                             type="button"
@@ -857,16 +827,23 @@ export function ChatPanel({
                               }
                             }}
                           >
-                            <span className="block truncate font-medium">{name}</span>
+                            <div className="flex items-center gap-2">
+                              <span className="truncate font-medium">
+                                {verified?.displayName || name}
+                              </span>
+                              {verified && (
+                                <span className="rounded-full bg-cyan-900/40 px-1.5 py-0.5 text-[9px] font-bold tracking-tight text-cyan-400 border border-cyan-800/50">
+                                  VERIFIED
+                                </span>
+                              )}
+                            </div>
                             {metaLine ? (
                               <span className="mt-0.5 block truncate text-[10px] font-normal text-slate-500">
                                 {metaLine}
                               </span>
                             ) : !installed ? (
                               <span className="mt-0.5 block truncate text-[10px] font-normal text-slate-600">
-                                {cat
-                                  ? "Not installed — click to pull"
-                                  : "Not in catalog — manual pull"}
+                                Not installed — click to pull
                               </span>
                             ) : null}
                           </button>

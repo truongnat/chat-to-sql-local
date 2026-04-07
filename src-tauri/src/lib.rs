@@ -16,6 +16,29 @@ use tauri::Manager;
 use tauri::State;
 use watcher::WatchRegistry;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct VerifiedModel {
+    pub name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    pub description: String,
+    #[serde(rename = "parameterSize")]
+    pub parameter_size: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct VerifiedModelsConfig {
+    pub verified_models: Vec<VerifiedModel>,
+}
+
+#[tauri::command]
+fn get_verified_models() -> Result<Vec<VerifiedModel>, String> {
+    let json = include_str!("verified_models.json");
+    let config: VerifiedModelsConfig =
+        serde_json::from_str(json).map_err(|e| format!("verified_models.json: {e}"))?;
+    Ok(config.verified_models)
+}
+
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     pub watchers: WatchRegistry,
@@ -330,13 +353,13 @@ pub fn run() {
             list_chat_messages,
             rebuild_schema_vector_index,
             search_schema_for_chat,
+            get_verified_models,
             ollama_launch::try_start_ollama,
             ollama_download::start_ollama_installer_download,
             ollama_download::ollama_installer_exists,
             ollama_download::install_ollama_from_download,
             ollama_proxy::ollama_api_tags,
             ollama_proxy::ollama_api_ps,
-            ollama_proxy::ollama_com_api_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

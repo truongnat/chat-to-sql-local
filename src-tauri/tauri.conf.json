@@ -12,18 +12,21 @@
   "app": {
     "windows": [
       {
-        "title": "Chat-to-SQL",
+        "title": "Chat-to-SQL (MVP)",
         "width": 1200,
         "height": 800
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:11434 http://127.0.0.1:11434 http://[::1]:11434 ipc: http://ipc.localhost"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "SQLChat.ai",
+    "shortDescription": "Local-only AI SQL Assistant",
+    "copyright": "Copyright © 2026 SQLChat.ai",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

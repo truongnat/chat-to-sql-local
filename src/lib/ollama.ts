@@ -3,9 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 /** Prefer `localhost` so IPv4/IPv6 resolution matches the OS (same as `curl localhost:11434`). */
 const BASE = "http://localhost:11434";
 
-/** Ollama registry: same `/api/tags` response shape as the local daemon; models here are pullable via `ollama pull`. */
-export const OLLAMA_LIBRARY_TAGS_URL = "https://ollama.com/api/tags";
-
 /**
  * Tauri 2 does not always set `window.isTauri`, so `isTauri()` from `@tauri-apps/api/core` can be false
  * inside a real app — then we'd wrongly use `fetch` (blocked / flaky in the WebView) instead of IPC + Rust proxy.
@@ -125,40 +122,6 @@ export async function listModels(): Promise<OllamaModel[]> {
   return normalizeTagEntries(raw);
 }
 
-function dedupeModelsByName(models: OllamaModel[]): OllamaModel[] {
-  const seen = new Set<string>();
-  const out: OllamaModel[] = [];
-  for (const m of models) {
-    const n = m.name?.trim();
-    if (!n || seen.has(n)) continue;
-    seen.add(n);
-    out.push(m);
-  }
-  out.sort((a, b) => a.name.localeCompare(b.name));
-  return out;
-}
-
-/**
- * Library catalog from ollama.com (pullable names + advertised sizes). Independent of the local daemon.
- * In Tauri, uses IPC + Rust to avoid WebView CORS limits.
- */
-export async function listOllamaLibraryCatalog(): Promise<OllamaModel[]> {
-  let payload: unknown;
-  if (useOllamaIpc()) {
-    payload = await invoke<unknown>("ollama_com_api_tags");
-  } else {
-    const r = await fetch(OLLAMA_LIBRARY_TAGS_URL, { method: "GET" });
-    if (!r.ok) throw new Error(`ollama.com tags failed: HTTP ${r.status}`);
-    try {
-      payload = await r.json();
-    } catch {
-      throw new Error("ollama.com /api/tags: invalid JSON");
-    }
-  }
-  const raw = extractModelsArrayFromTagsPayload(payload);
-  return dedupeModelsByName(normalizeTagEntries(raw));
-}
-
 /** Running / loaded models (VRAM). Fails soft if server is old or errors. */
 /** Order for UI: in-memory models first (`/api/ps`), then by name. */
 export function sortLocalModelsForPicker(
@@ -242,36 +205,62 @@ export async function* chatStream(
   model: string,
   messages: ChatMessage[],
 ): AsyncGenerator<string> {
-  const r = await fetch(`${BASE}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, stream: true }),
-  });
-  if (!r.ok || !r.body) {
-    const t = await r.text();
-    throw new Error(t || `Chat failed: ${r.status}`);
-  }
-  const reader = r.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const obj = JSON.parse(line) as {
-          message?: { content?: string };
-          done?: boolean;
-        };
-        const piece = obj.message?.content;
-        if (piece) yield piece;
-      } catch {
-        /* ignore */
-      }
+  const ctrl = new AbortController();
+  // 30s timeout to even get a response header from the local Ollama
+  const timeoutId = setTimeout(() => ctrl.abort(), 30000);
+
+  try {
+    const r = await fetch(`${BASE}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, stream: true }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!r.ok || !r.body) {
+      const t = await r.text().catch(() => "");
+      throw new Error(t || `Chat failed: HTTP ${r.status}`);
     }
+
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const obj = JSON.parse(line) as {
+              message?: { content?: string };
+              done?: boolean;
+              error?: string;
+            };
+            if (obj.error) {
+              throw new Error(obj.error);
+            }
+            const piece = obj.message?.content;
+            if (piece) yield piece;
+          } catch (e) {
+            if (e instanceof Error && e.message.includes("AbortError")) throw e;
+            /* ignore partial JSON but log if it looks like a real error */
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  } catch (e) {
+    clearTimeout(timeoutId);
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error("Ollama request timed out. Is the model too large or Ollama busy?");
+    }
+    throw e;
   }
 }

@@ -424,26 +424,106 @@ function parseFileContent(
   return { tables, objects };
 }
 
+function processAlterNode(
+  node: any,
+  tablesByName: Map<string, ParsedTable>,
+  parser: Parser,
+): void {
+  if (node.type !== "alter" || !node.table) return;
+  const tableName = (Array.isArray(node.table) ? node.table[0].table : node.table.table).toLowerCase();
+  const table = tablesByName.get(tableName);
+  if (!table) return;
+
+  const exprs = Array.isArray(node.expr) ? node.expr : [node.expr];
+  for (const expr of exprs) {
+    if (expr.action === "add" && expr.resource === "constraint" && expr.create_definitions) {
+      for (const def of expr.create_definitions) {
+        if (def.constraint_type === "FOREIGN KEY") {
+          const cols = (def.definition ?? []).map((r: any) => columnRefName(r));
+          const refTarget = referenceTargetFromDefinition(def.reference_definition);
+          if (cols.length && refTarget?.table) {
+            const refCols = refTarget.columns.length > 0 ? refTarget.columns : ["id"];
+            table.foreignKeys.push({
+              columns: cols.map(cleanIdent),
+              referencedTable: cleanIdent(refTarget.table),
+              referencedColumns: refCols.map(cleanIdent),
+            });
+          }
+        }
+      }
+    }
+  }
+}
+
 export function buildSchemaFromFiles(
   files: { relativePath: string; content: string }[],
   dialect: Dialect,
 ): ParsedSchemaPayload {
   const parser = new Parser();
+  // Sort files lexicographically by relative path to ensure consistent merge order
+  const sortedFiles = [...files].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  
   const byName = new Map<string, ParsedTable>();
   const schemaObjects: ParsedSchemaObject[] = [];
 
-  for (const f of files) {
-    const { tables, objects } = parseFileContent(
-      f.content,
-      f.relativePath,
-      dialect,
-      parser,
-    );
-    for (const t of tables) {
-      byName.set(t.name.toLowerCase(), t);
+  for (const f of sortedFiles) {
+    let nodes = tryParseAst(f.content, dialect, parser);
+    if (!nodes || nodes.length === 0) {
+      const stmts = splitSqlStatements(f.content);
+      nodes = [];
+      for (const s of stmts) {
+        const parsed = tryParseAst(s, dialect, parser);
+        if (parsed) nodes.push(...parsed);
+      }
     }
-    schemaObjects.push(...objects);
+
+    if (!nodes) continue;
+
+    for (const node of nodes) {
+      if (node.type === "create") {
+        const { table, objects } = processCreateNode(
+          node as Create,
+          f.relativePath,
+          dialect,
+          parser,
+        );
+        if (table) {
+          const lowerName = table.name.toLowerCase();
+          if (byName.has(lowerName)) {
+            console.warn(`[SchemaMerge] Table "${table.name}" from ${f.relativePath} is overwriting previous definition.`);
+          }
+          byName.set(lowerName, table);
+        }
+        schemaObjects.push(...objects);
+      } else if (node.type === "alter") {
+        processAlterNode(node, byName, parser);
+      }
+    }
   }
 
   return { tables: [...byName.values()], schemaObjects };
+}
+
+export function buildSchemaFromFilesAsync(
+  files: { relativePath: string; content: string }[],
+  dialect: Dialect,
+): Promise<ParsedSchemaPayload> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./parseSchema.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    worker.onmessage = (e) => {
+      if (e.data.type === "success") {
+        resolve(e.data.result);
+      } else {
+        reject(new Error(e.data.error));
+      }
+      worker.terminate();
+    };
+    worker.onerror = (err) => {
+      reject(err);
+      worker.terminate();
+    };
+    worker.postMessage({ files, dialect });
+  });
 }

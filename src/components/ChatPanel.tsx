@@ -21,6 +21,7 @@ import {
   createChatSession,
   deleteChatSession,
   getVerifiedModels,
+  verifyOllamaModels,
   installOllamaFromDownload,
   listChatMessages,
   listChatSessions,
@@ -30,6 +31,7 @@ import {
   tryStartOllama,
   updateChatSessionTitle,
   updateWorkspaceModel,
+  type VerificationResult,
 } from "../lib/api";
 import type { Dialect } from "../lib/api";
 import {
@@ -46,6 +48,7 @@ import {
 import type { OllamaModel, OllamaRunningModel } from "../lib/ollama";
 import {
   chatStream,
+  DEFAULT_EMBED_MODEL,
   listModels,
   listRunningModels,
   ollamaHealth,
@@ -100,9 +103,11 @@ export function ChatPanel({
   dialect: Dialect;
 }) {
   const [ollamaOk, setOllamaOk] = useState<boolean | null>(null);
+  const [verification, setVerification] = useState<VerificationResult | null>(null);
   const [ollamaTagsError, setOllamaTagsError] = useState<string | null>(null);
   const [verifiedModels, setVerifiedModels] = useState<VerifiedModel[]>([]);
   const [localModels, setLocalModels] = useState<OllamaModel[]>([]);
+  const [hasEmbedModel, setHasEmbedModel] = useState<boolean | null>(null);
   const [runningModels, setRunningModels] = useState<OllamaRunningModel[]>([]);
   const [model, setModel] = useState(
     () => workspace.ollamaModel?.trim() || DEFAULT_SUGGESTED_MODEL,
@@ -147,6 +152,7 @@ export function ChatPanel({
         setOllamaTagsError(null);
         setLocalModels(tags);
         setRunningModels(running);
+        setHasEmbedModel(localListHasModel(tags, DEFAULT_EMBED_MODEL));
         const names = tags.map((m) => m.name).filter(Boolean);
         setModel((prev) => {
           if (prev) return prev;
@@ -606,6 +612,23 @@ export function ChatPanel({
             )}
           </div>
         )}
+        {ollamaOk && hasEmbedModel === false && (
+          <div className="flex flex-col gap-2 rounded-lg border border-cyan-900/50 bg-cyan-950/40 px-3 py-2 sm:flex-row sm:items-center">
+            <span className="flex-1 text-xs text-cyan-100">
+              <strong className="text-cyan-400">Advanced RAG is inactive:</strong>{" "}
+              Missing <code className="text-cyan-200/90">{DEFAULT_EMBED_MODEL}</code>.
+              AI search will be less accurate.
+            </span>
+            <button
+              type="button"
+              disabled={!!pullingName}
+              className="rounded bg-cyan-800 px-3 py-1 text-xs font-medium text-white hover:bg-cyan-700 disabled:opacity-50"
+              onClick={() => void pullModelByName(DEFAULT_EMBED_MODEL)}
+            >
+              {pullingName === DEFAULT_EMBED_MODEL ? "Pulling…" : "Pull now"}
+            </button>
+          </div>
+        )}
       </div>
       {pullLog && (
         <pre className="max-h-24 shrink-0 overflow-auto border-b border-slate-800 bg-black/30 px-3 py-1 text-[10px] text-slate-400">
@@ -778,6 +801,8 @@ export function ChatPanel({
                       const busy = pullingName === name;
                       const run = runningByName.get(name);
                       const verified = verifiedModels.find((v) => v.name === name);
+                      const verifResult = verification?.models?.find((m) => m.name === name);
+                      const tampered = verifResult && !verifResult.verified && verifResult.reason.includes("Checksum mismatch");
 
                       const metaParts = [
                         loc?.details?.parameter_size || verified?.parameterSize,
@@ -834,6 +859,11 @@ export function ChatPanel({
                               {verified && (
                                 <span className="rounded-full bg-cyan-900/40 px-1.5 py-0.5 text-[9px] font-bold tracking-tight text-cyan-400 border border-cyan-800/50">
                                   VERIFIED
+                                </span>
+                              )}
+                              {tampered && (
+                                <span className="rounded-full bg-rose-900/40 px-1.5 py-0.5 text-[9px] font-bold tracking-tight text-rose-400 border border-rose-800/50">
+                                  TAMPERED
                                 </span>
                               )}
                             </div>

@@ -21,9 +21,12 @@ pub struct VerifiedModel {
     pub name: String,
     #[serde(rename = "displayName")]
     pub display_name: String,
+    pub checksum: String,
     pub description: String,
     #[serde(rename = "parameterSize")]
     pub parameter_size: String,
+    pub recommended: bool,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -37,6 +40,81 @@ fn get_verified_models() -> Result<Vec<VerifiedModel>, String> {
     let config: VerifiedModelsConfig =
         serde_json::from_str(json).map_err(|e| format!("verified_models.json: {e}"))?;
     Ok(config.verified_models)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AuditLog {
+    pub id: i64,
+    pub timestamp: i64,
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+    #[serde(rename = "workspaceId")]
+    pub workspace_id: Option<i64>,
+    pub metadata: Option<String>,
+}
+
+#[tauri::command]
+fn get_audit_logs(state: State<AppState>) -> Result<Vec<AuditLog>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, timestamp, event_type, workspace_id, metadata FROM audit_logs ORDER BY id DESC LIMIT 200")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AuditLog {
+                id: r.get(0)?,
+                timestamp: r.get(1)?,
+                event_type: r.get(2)?,
+                workspace_id: r.get(3)?,
+                metadata: r.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut logs = Vec::new();
+    for row in rows {
+        logs.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(logs)
+}
+
+#[tauri::command]
+fn export_audit_logs(state: State<AppState>) -> Result<String, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, timestamp, event_type, workspace_id, metadata, prev_hash, hash FROM audit_logs ORDER BY id ASC")
+        .map_err(|e| e.to_string())?;
+    
+    #[derive(serde::Serialize)]
+    struct FullAuditLog {
+        id: i64,
+        timestamp: i64,
+        event_type: String,
+        workspace_id: Option<i64>,
+        metadata: Option<String>,
+        prev_hash: Option<String>,
+        hash: String,
+    }
+
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(FullAuditLog {
+                id: r.get(0)?,
+                timestamp: r.get(1)?,
+                event_type: r.get(2)?,
+                workspace_id: r.get(3)?,
+                metadata: r.get(4)?,
+                prev_hash: r.get(5)?,
+                hash: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut logs = Vec::new();
+    for row in rows {
+        logs.push(row.map_err(|e| e.to_string())?);
+    }
+    
+    serde_json::to_string_pretty(&logs).map_err(|e| e.to_string())
 }
 
 pub struct AppState {
@@ -53,6 +131,44 @@ fn db_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     dir.push("sql-chat");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("app.db"))
+}
+
+fn get_or_create_app_key(app: &tauri::AppHandle) -> Result<String, String> {
+    use keyring::Entry;
+    let service = "sql-chat-app";
+    let user = "default-user";
+    let entry = Entry::new(service, user).map_err(|e| e.to_string())?;
+
+    // 1. Try keyring
+    if let Ok(key) = entry.get_password() {
+        return Ok(key);
+    }
+
+    // 2. Fallback to .key file for migration
+    let mut path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?;
+    path.push("sql-chat");
+    let key_file = path.join(".key");
+
+    if key_file.exists() {
+        let key = std::fs::read_to_string(&key_file).map_err(|e| e.to_string())?;
+        // Migrate to keyring
+        if entry.set_password(&key).is_ok() {
+            let _ = std::fs::remove_file(&key_file);
+        }
+        return Ok(key);
+    }
+
+    // 3. Generate new key
+    use rand::RngCore;
+    let mut key_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key_bytes);
+    let key_hex = hex::encode(key_bytes);
+    
+    entry.set_password(&key_hex).map_err(|e| e.to_string())?;
+    Ok(key_hex)
 }
 
 fn restart_watchers(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
@@ -292,8 +408,9 @@ fn rebuild_schema_vector_index(
     workspace_id: i64,
 ) -> Result<(), String> {
     let db_path = state.db_path.clone();
+    let key = get_or_create_app_key(&app)?;
     std::thread::spawn(move || {
-        vector_index::rebuild_workspace_index_blocking(&app, &db_path, workspace_id);
+        vector_index::rebuild_workspace_index_blocking(&app, &db_path, &key, workspace_id);
     });
     Ok(())
 }
@@ -317,7 +434,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let path = db_file_path(app.handle())?;
-            let conn = db::open_db(&path).map_err(|e| format!("db open: {e}"))?;
+            let key = get_or_create_app_key(app.handle())?;
+            let conn = db::open_db(&path, &key).map_err(|e| format!("db open: {e}"))?;
             let state = AppState {
                 db: Mutex::new(conn),
                 watchers: WatchRegistry {
@@ -354,11 +472,14 @@ pub fn run() {
             rebuild_schema_vector_index,
             search_schema_for_chat,
             get_verified_models,
+            get_audit_logs,
+            export_audit_logs,
             ollama_launch::try_start_ollama,
             ollama_download::start_ollama_installer_download,
             ollama_download::ollama_installer_exists,
             ollama_download::install_ollama_from_download,
             ollama_proxy::ollama_api_tags,
+            ollama_proxy::verify_ollama_models,
             ollama_proxy::ollama_api_ps,
         ])
         .run(tauri::generate_context!())

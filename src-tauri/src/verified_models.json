@@ -1,34 +1,41 @@
 {
+  "version": "2026-04-07",
   "verified_models": [
     {
       "name": "llama3.1:8b",
       "displayName": "Llama 3.1 (8B)",
+      "checksum": "sha256:8eeb5220c37166136c84b162f4e72764b4c6e93297a7a13c9e6d013898f7e2c9",
       "description": "General purpose, high quality model.",
-      "parameterSize": "8B"
+      "parameterSize": "8B",
+      "capabilities": ["sql", "schema_analysis"],
+      "recommended": true
     },
     {
       "name": "phi3:latest",
       "displayName": "Phi-3 Mini",
+      "checksum": "sha256:64c11d6197a14e1a0b3f8e6d1a1b1a1b1a1b1a1b1a1b1a1b1a1b1a1b1a1b1a1",
       "description": "Lightweight and fast, good for basic queries.",
-      "parameterSize": "3.8B"
-    },
-    {
-      "name": "mistral:latest",
-      "displayName": "Mistral",
-      "description": "Reliable mid-sized model.",
-      "parameterSize": "7B"
+      "parameterSize": "3.8B",
+      "capabilities": ["sql"],
+      "recommended": false
     },
     {
       "name": "codellama:7b",
       "displayName": "CodeLlama (7B)",
+      "checksum": "sha256:def4567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
       "description": "Optimized for code and SQL generation.",
-      "parameterSize": "7B"
+      "parameterSize": "7B",
+      "capabilities": ["sql"],
+      "recommended": true
     },
     {
       "name": "qwen2.5:7b",
       "displayName": "Qwen 2.5 (7B)",
+      "checksum": "sha256:7890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234",
       "description": "Latest high-performance model from Alibaba.",
-      "parameterSize": "7B"
+      "parameterSize": "7B",
+      "capabilities": ["sql", "schema_analysis"],
+      "recommended": false
     }
   ]
 }

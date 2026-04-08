@@ -8,8 +8,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
+pub fn open_db(path: &Path, key: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    // SQLCipher: set the key immediately after opening
+    conn.pragma_update(None, "key", key)?;
+    
     conn.execute("PRAGMA foreign_keys = ON", [])?;
     migrate(&conn)?;
     conn.execute(
@@ -18,7 +21,9 @@ pub fn open_db(path: &Path) -> rusqlite::Result<Connection> {
             timestamp INTEGER NOT NULL,
             event_type TEXT NOT NULL,
             workspace_id INTEGER,
-            details TEXT,
+            metadata TEXT,
+            prev_hash TEXT,
+            hash TEXT NOT NULL,
             FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL
         )",
         [],
@@ -31,12 +36,35 @@ pub fn log_audit_event(
     conn: &Connection,
     event_type: &str,
     workspace_id: Option<i64>,
-    details: Option<&str>,
+    metadata: Option<serde_json::Value>,
 ) -> Result<(), rusqlite::Error> {
+    use sha2::{Digest, Sha256};
+
+    let prev_hash: Option<String> = conn
+        .query_row(
+            "SELECT hash FROM audit_logs ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let timestamp = now_ms();
+    let metadata_str = metadata.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "{}".into());
+    let ws_id_str = workspace_id.map(|id| id.to_string()).unwrap_or_else(|| "none".into());
+    let prev_hash_str = prev_hash.as_deref().unwrap_or("genesis");
+
+    let mut hasher = Sha256::new();
+    hasher.update(timestamp.to_string().as_bytes());
+    hasher.update(event_type.as_bytes());
+    hasher.update(ws_id_str.as_bytes());
+    hasher.update(metadata_str.as_bytes());
+    hasher.update(prev_hash_str.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+
     conn.execute(
-        "INSERT INTO audit_logs (timestamp, event_type, workspace_id, details)
-         VALUES (strftime('%s','now') * 1000, ?, ?, ?)",
-        params![event_type, workspace_id, details],
+        "INSERT INTO audit_logs (timestamp, event_type, workspace_id, metadata, prev_hash, hash)
+         VALUES (?, ?, ?, ?, ?, ?)",
+        params![timestamp, event_type, workspace_id, metadata_str, prev_hash, hash],
     )?;
     Ok(())
 }
@@ -241,7 +269,7 @@ pub fn create_workspace(conn: &Connection, name: &str, root_path: &str) -> rusql
         params![name, root_path, created_at],
     )?;
     let id = conn.last_insert_rowid();
-    let _ = log_audit_event(conn, "WORKSPACE_CREATE", Some(id), Some(root_path));
+    let _ = log_audit_event(conn, "WORKSPACE_CREATE", Some(id), Some(serde_json::json!({ "path": root_path })));
     get_workspace(conn, id).map(|w| w.expect("inserted"))
 }
 
@@ -348,30 +376,18 @@ fn rel_path_from_root(root: &Path, file: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// All `.sql` / `.ddl` files under `root_dir`, depth-first stack walk, sorted by relative path.
+/// All `.sql` / `.ddl` files under `root_dir`, respecting .gitignore via `ignore` crate.
 fn collect_sql_ddl_under(root_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
+    use ignore::WalkBuilder;
     let mut found = Vec::new();
-    let mut stack = vec![root_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let read = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
+    for entry in WalkBuilder::new(root_dir).build() {
+        let entry = match entry {
+            Ok(e) => e,
             Err(_) => continue,
         };
-        for entry in read.flatten() {
-            let path = entry.path();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if should_skip_subdir(name) {
-                        continue;
-                    }
-                }
-                stack.push(path);
-            } else if ft.is_file() && is_sql_or_ddl_file(&path) {
-                found.push(path);
-            }
+        let path = entry.path();
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) && is_sql_or_ddl_file(path) {
+            found.push(path.to_path_buf());
         }
     }
     found.sort_by(|a, b| rel_path_from_root(root_dir, a).cmp(&rel_path_from_root(root_dir, b)));
@@ -439,7 +455,7 @@ pub fn rescan_workspace_files(
                 conn,
                 "FILE_SKIPPED_TOO_LARGE",
                 Some(workspace_id),
-                Some(&rel_str),
+                Some(serde_json::json!({ "path": rel_str })),
             );
             continue;
         }

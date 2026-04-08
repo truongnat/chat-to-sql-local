@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 /** Prefer `localhost` so IPv4/IPv6 resolution matches the OS (same as `curl localhost:11434`). */
 const BASE = "http://localhost:11434";
 
+export const DEFAULT_EMBED_MODEL = "nomic-embed-text";
+
 /**
  * Tauri 2 does not always set `window.isTauri`, so `isTauri()` from `@tauri-apps/api/core` can be false
  * inside a real app — then we'd wrongly use `fetch` (blocked / flaky in the WebView) instead of IPC + Rust proxy.

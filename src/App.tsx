@@ -9,11 +9,13 @@ import {
   Pencil,
   RefreshCw,
   Trash2,
+  ShieldCheck,
   X,
 } from "lucide-react";
 import { ChatPanel } from "./components/ChatPanel";
 import { SchemaDiagram } from "./components/SchemaDiagram";
 import { SchemaTree } from "./components/SchemaTree";
+import { AuditLogModal } from "./components/AuditLogModal";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -46,7 +48,7 @@ import {
   updateWorkspace,
   updateWorkspaceDialect,
 } from "./lib/api";
-import { buildSchemaFromFiles } from "./lib/parseSchema";
+import { buildSchemaFromFilesAsync } from "./lib/parseSchema";
 
 type SchemaIndexProgressPayload = {
   workspaceId: number;
@@ -88,6 +90,7 @@ export default function App() {
   const [vectorIndex, setVectorIndex] = useState<SchemaIndexProgressPayload | null>(
     null,
   );
+  const [auditModalOpen, setAuditModalOpen] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -149,7 +152,7 @@ export default function App() {
         const list = await listWorkspaces();
         const w = list.find((x) => x.id === wsId);
         const dialectUse = d ?? ((w?.dialect ?? "postgresql") as Dialect);
-        const schema = buildSchemaFromFiles(files, dialectUse);
+        const schema = await buildSchemaFromFilesAsync(files, dialectUse);
         await saveParsedSchema(wsId, schema);
         await loadParsedSchema(wsId).then(setTables);
         await loadStats(wsId);
@@ -701,6 +704,16 @@ export default function App() {
               type="button"
               variant="ghost"
               size="icon-sm"
+              className="text-sidebar-foreground/80"
+              title="Security Logs"
+              onClick={() => setAuditModalOpen(true)}
+            >
+              <ShieldCheck className="size-4" />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
               className="text-destructive hover:bg-destructive/15 hover:text-destructive"
               title="Remove workspace"
               disabled={!active}
@@ -808,6 +821,11 @@ export default function App() {
       )}
 
       {workspaceModalOverlay}
+
+      <AuditLogModal
+        open={auditModalOpen}
+        onOpenChange={setAuditModalOpen}
+      />
     </div>
   );
 }

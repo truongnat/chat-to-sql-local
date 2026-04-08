@@ -112,10 +112,41 @@ export interface VerifiedModel {
   displayName: string;
   description: string;
   parameterSize: string;
+  checksum: string;
+}
+
+export interface VerificationResult {
+  models: {
+    name: string;
+    digest: string;
+    verified: boolean;
+    reason: string;
+    details: any;
+  }[];
+}
+
+export interface AuditLog {
+  id: number;
+  timestamp: number;
+  eventType: string;
+  workspaceId: number | null;
+  metadata: string | null;
+}
+
+export function getAuditLogs(): Promise<AuditLog[]> {
+  return invoke("get_audit_logs");
+}
+
+export function exportAuditLogs(): Promise<string> {
+  return invoke("export_audit_logs");
 }
 
 export function getVerifiedModels(): Promise<VerifiedModel[]> {
   return invoke("get_verified_models");
+}
+
+export function verifyOllamaModels(): Promise<VerificationResult> {
+  return invoke("verify_ollama_models");
 }
 
 export function createWorkspace(

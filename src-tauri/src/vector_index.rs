@@ -216,7 +216,7 @@ fn chunk_file(rel: &str, content: &str) -> Vec<String> {
 }
 
 /// Rebuild index: table chunks + file chunks, embeddings when Ollama is up.
-pub fn rebuild_workspace_index_blocking(app: &AppHandle, db_path: &Path, workspace_id: i64) {
+pub fn rebuild_workspace_index_blocking(app: &AppHandle, db_path: &Path, key: &str, workspace_id: i64) {
     let emit = |p: SchemaIndexProgress| {
         let _ = app.emit("schema-index-progress", &p);
     };
@@ -229,7 +229,7 @@ pub fn rebuild_workspace_index_blocking(app: &AppHandle, db_path: &Path, workspa
         message: Some("Building schema index…".into()),
     });
 
-    let conn = match Connection::open(db_path) {
+    let conn = match db::open_db(db_path, key) {
         Ok(c) => c,
         Err(e) => {
             let _ = app.emit(
